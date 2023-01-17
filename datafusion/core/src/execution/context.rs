@@ -15,7 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+
+
 //! SessionContext contains methods for registering data sources and executing queries
+
+/// Newly added dependencies
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
 use crate::{
     catalog::{
         catalog::{CatalogList, MemoryCatalogList},
@@ -1850,6 +1856,8 @@ pub struct TaskContext {
     aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
     /// Runtime environment associated with this task context
     runtime: Arc<RuntimeEnv>,
+    /// AtomicBool value for suspend 
+    suspend: AtomicBool,
 }
 
 impl TaskContext {
@@ -1869,7 +1877,23 @@ impl TaskContext {
             scalar_functions,
             aggregate_functions,
             runtime,
+            suspend: AtomicBool::new(false)
         }
+    }
+
+    /// Check whether the task is running
+    pub fn running(&self) -> bool {
+        !self.suspend.load(Relaxed)
+    }
+
+    /// Suspend the task
+    pub fn suspend(&self) {
+        self.suspend.store(true, Relaxed);
+    }
+
+    /// Resume the task
+    pub fn resume(&self) {
+        self.suspend.store(false, Relaxed);
     }
 
     /// Return the SessionConfig associated with the Task
@@ -1949,6 +1973,7 @@ impl From<&SessionContext> for TaskContext {
             scalar_functions,
             aggregate_functions,
             runtime,
+            suspend: AtomicBool::new(false),
         }
     }
 }
@@ -1968,6 +1993,7 @@ impl From<&SessionState> for TaskContext {
             scalar_functions,
             aggregate_functions,
             runtime,
+            suspend: AtomicBool::new(false),
         }
     }
 }

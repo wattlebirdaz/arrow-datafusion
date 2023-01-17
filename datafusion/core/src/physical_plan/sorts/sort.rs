@@ -919,9 +919,17 @@ async fn do_sort(
         fetch,
     );
     context.runtime_env().register_requester(sorter.id());
+
+    let suspend_call = "suspend_call".to_string();
     while let Some(batch) = input.next().await {
+        if !context.running() {
+            return Err(DataFusionError::Execution(suspend_call));
+        }
         let batch = batch?;
         sorter.insert_batch(batch, &tracking_metrics).await?;
+    }
+    if !context.running() {
+        return Err(DataFusionError::Execution(suspend_call));
     }
     let result = sorter.sort().await;
     debug!(
