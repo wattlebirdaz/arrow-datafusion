@@ -21,6 +21,7 @@
 
 use crate::error::{DataFusionError, Result};
 use crate::execution::context::TaskContext;
+use crate::execution::disk_manager::NamedPersistentFile;
 use crate::execution::memory_manager::{
     human_readable_size, ConsumerType, MemoryConsumer, MemoryConsumerId, MemoryManager,
 };
@@ -55,10 +56,9 @@ use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tempfile::NamedTempFile;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task;
 
@@ -71,11 +71,12 @@ use tokio::task;
 /// 2.2 if the memory threshold is reached, sort all buffered batches and spill to file.
 ///     buffer the batch in memory, go to 1.
 /// 3. when input is exhausted, merge all in memory batches and spills to get a total order.
+
 struct ExternalSorter {
     id: MemoryConsumerId,
     schema: SchemaRef,
     in_mem_batches: Mutex<Vec<BatchWithSortArray>>,
-    spills: Mutex<Vec<NamedTempFile>>,
+    spills: Mutex<Vec<NamedPersistentFile>>,
     /// Sort expressions
     expr: Vec<PhysicalSortExpr>,
     session_config: Arc<SessionConfig>,
@@ -290,7 +291,7 @@ impl MemoryConsumer for ExternalSorter {
             .metrics_set
             .new_intermediate_tracking(partition, self.runtime.clone());
 
-        let spillfile = self.runtime.disk_manager.create_tmp_file()?;
+        let spillfile = self.runtime.disk_manager.create_persistent_file()?;
         let stream = in_mem_partial_sort(
             &mut in_mem_batches,
             self.schema.clone(),
@@ -593,7 +594,7 @@ impl RecordBatchStream for SortedSizedRecordBatchStream {
 
 async fn spill_partial_sorted_stream(
     in_mem_stream: &mut SendableRecordBatchStream,
-    path: &Path,
+    path: &String,
     schema: SchemaRef,
 ) -> Result<()> {
     let (sender, receiver) = tokio::sync::mpsc::channel(2);
@@ -613,7 +614,7 @@ async fn spill_partial_sorted_stream(
 }
 
 fn read_spill_as_stream(
-    path: NamedTempFile,
+    path: NamedPersistentFile,
     schema: SchemaRef,
 ) -> Result<SendableRecordBatchStream> {
     let (sender, receiver): (
@@ -622,7 +623,11 @@ fn read_spill_as_stream(
     ) = tokio::sync::mpsc::channel(2);
     let join_handle = task::spawn_blocking(move || {
         if let Err(e) = read_spill(sender, path.path()) {
-            error!("Failure while reading spill file: {:?}. Error: {}", path, e);
+            error!(
+                "Failure while reading spill file: {:?}. Error: {}",
+                path.path(),
+                e
+            );
         }
     });
     Ok(RecordBatchReceiverStream::create(
@@ -651,7 +656,7 @@ fn write_sorted(
     Ok(())
 }
 
-fn read_spill(sender: Sender<ArrowResult<RecordBatch>>, path: &Path) -> Result<()> {
+fn read_spill(sender: Sender<ArrowResult<RecordBatch>>, path: &String) -> Result<()> {
     let file = BufReader::new(File::open(path)?);
     let reader = FileReader::try_new(file, None)?;
     for batch in reader {

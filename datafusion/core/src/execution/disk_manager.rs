@@ -22,6 +22,8 @@ use crate::error::{DataFusionError, Result};
 use log::debug;
 use parking_lot::Mutex;
 use rand::{thread_rng, Rng};
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::{Builder, NamedTempFile, TempDir};
@@ -73,6 +75,17 @@ pub struct DiskManager {
     local_dirs: Mutex<Vec<TempDir>>,
 }
 
+pub struct NamedPersistentFile {
+    path: String,
+    file: File,
+}
+
+impl NamedPersistentFile {
+    pub fn path(&self) -> &String {
+        &self.path
+    }
+}
+
 impl DiskManager {
     /// Create a DiskManager given the configuration
     pub fn try_new(config: DiskManagerConfig) -> Result<Arc<Self>> {
@@ -111,6 +124,21 @@ impl DiskManager {
         }
 
         create_tmp_file(&local_dirs)
+    }
+
+    /// Return a persistent file from a randomized choice in the current directory
+    pub fn create_persistent_file(&self) -> Result<NamedPersistentFile> {
+        let local_dirs = String::from("./temp/");
+        let mut rng = rand::thread_rng();
+        let x: u64 = rng.gen();
+        let path = local_dirs + &x.to_string();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        Ok(NamedPersistentFile { path, file })
     }
 }
 

@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
-
 //! SessionContext contains methods for registering data sources and executing queries
 
 /// Newly added dependencies
@@ -1856,7 +1854,7 @@ pub struct TaskContext {
     aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
     /// Runtime environment associated with this task context
     runtime: Arc<RuntimeEnv>,
-    /// AtomicBool value for suspend 
+    /// AtomicBool value for suspend
     suspend: AtomicBool,
 }
 
@@ -1877,7 +1875,7 @@ impl TaskContext {
             scalar_functions,
             aggregate_functions,
             runtime,
-            suspend: AtomicBool::new(false)
+            suspend: AtomicBool::new(false),
         }
     }
 
