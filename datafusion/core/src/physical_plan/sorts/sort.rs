@@ -62,6 +62,9 @@ use std::task::{Context, Poll};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task;
 
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+
 /// Sort arbitrary size of data to get a total order (may spill several times during sorting based on free memory available).
 ///
 /// The basic architecture of the algorithm:
@@ -108,6 +111,23 @@ impl ExternalSorter {
             metrics_set,
             metrics,
             fetch,
+        }
+    }
+
+    async fn serialize_for_suspend(&self, cursor: i32) {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .append(true)
+            .create(true)
+            .open("suspend.log")
+            .unwrap();
+        writeln!(file, "{}", cursor).unwrap();
+
+        let mut spills = self.spills.lock().await;
+        writeln!(file, "{}", spills.len()).unwrap();
+        for spill in spills.drain(..) {
+            writeln!(file, "{}", spill.path()).unwrap();
         }
     }
 
@@ -926,14 +946,18 @@ async fn do_sort(
     context.runtime_env().register_requester(sorter.id());
 
     let suspend_call = "suspend_call".to_string();
+    let mut cursor = 0;
     while let Some(batch) = input.next().await {
         if !context.running() {
+            sorter.serialize_for_suspend(cursor).await;
             return Err(DataFusionError::Execution(suspend_call));
         }
+        cursor += 1;
         let batch = batch?;
         sorter.insert_batch(batch, &tracking_metrics).await?;
     }
     if !context.running() {
+        sorter.serialize_for_suspend(cursor).await;
         return Err(DataFusionError::Execution(suspend_call));
     }
     let result = sorter.sort().await;
