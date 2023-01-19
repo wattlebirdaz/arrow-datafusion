@@ -129,6 +129,14 @@ impl ExternalSorter {
         for spill in spills.drain(..) {
             writeln!(file, "{}", spill.path()).unwrap();
         }
+
+        let in_mem_batches = self.in_mem_batches.lock().await;
+        let path: PathBuf = "intermediate.log".into();
+        let mut writer = IPCWriter::new(&path, &self.schema).unwrap();
+        for batch_with_sort_array in in_mem_batches.iter() {
+            writer.write(&batch_with_sort_array.sorted_batch).unwrap();
+        }
+        writer.finish().unwrap();
     }
 
     async fn insert_batch(
