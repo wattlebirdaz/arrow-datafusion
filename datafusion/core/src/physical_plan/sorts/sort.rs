@@ -118,7 +118,7 @@ impl ExternalSorter {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
-            .append(true)
+            .truncate(true)
             .create(true)
             .open("suspend.log")
             .unwrap();
@@ -129,8 +129,16 @@ impl ExternalSorter {
         for spill in spills.drain(..) {
             writeln!(file, "{}", spill.path()).unwrap();
         }
+        file.sync_all().unwrap();
 
         let in_mem_batches = self.in_mem_batches.lock().await;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open("intermediate.log")
+            .unwrap();
         let path: PathBuf = "intermediate.log".into();
         let mut writer = IPCWriter::new(&path, &self.schema).unwrap();
         for batch_with_sort_array in in_mem_batches.iter() {
