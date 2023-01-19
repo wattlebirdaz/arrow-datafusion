@@ -63,6 +63,10 @@ impl fmt::Display for TryCastExpr {
 }
 
 impl PhysicalExpr for TryCastExpr {
+    fn index(&self) -> usize {
+        panic!("Not implemented");
+        0
+    }
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self

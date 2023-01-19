@@ -69,6 +69,10 @@ impl std::fmt::Display for GetIndexedFieldExpr {
 }
 
 impl PhysicalExpr for GetIndexedFieldExpr {
+    fn index(&self) -> usize {
+        panic!("Not implemented");
+        0
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }

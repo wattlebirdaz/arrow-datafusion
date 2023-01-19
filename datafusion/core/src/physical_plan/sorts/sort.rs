@@ -63,6 +63,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task;
 
 use std::fs::OpenOptions;
+use std::io::BufRead;
 use std::io::{self, Write};
 
 /// Sort arbitrary size of data to get a total order (may spill several times during sorting based on free memory available).
@@ -74,6 +75,9 @@ use std::io::{self, Write};
 /// 2.2 if the memory threshold is reached, sort all buffered batches and spill to file.
 ///     buffer the batch in memory, go to 1.
 /// 3. when input is exhausted, merge all in memory batches and spills to get a total order.
+
+const SPILL_LOG_FILE: &str = "spill.log";
+const INMEM_LOG_FILE: &str = "inmem.log";
 
 struct ExternalSorter {
     id: MemoryConsumerId,
@@ -114,18 +118,65 @@ impl ExternalSorter {
         }
     }
 
+    fn suspend_exists(&self) -> bool {
+        std::path::Path::new(SPILL_LOG_FILE).exists()
+            && std::path::Path::new(INMEM_LOG_FILE).exists()
+    }
+
+    async fn deserialize_for_resume(&self) -> i32 {
+        let file = OpenOptions::new().read(true).open(SPILL_LOG_FILE).unwrap();
+        let reader = BufReader::new(file);
+        let mut spills = self.spills.lock().await;
+        let mut cursor = 0;
+        for (index, line) in reader.lines().enumerate() {
+            let line = line.unwrap();
+            println!("{}, {}", index, line);
+            if index == 0 {
+                match line.parse::<i32>() {
+                    Ok(i) => cursor = i,
+                    Err(_) => panic!("Read {}", SPILL_LOG_FILE),
+                }
+            } else {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&line)
+                    .unwrap();
+                spills.push(NamedPersistentFile { path: line, file });
+            }
+        }
+
+        let mut in_mem_batches = self.in_mem_batches.lock().await;
+        let file = BufReader::new(File::open(INMEM_LOG_FILE).unwrap());
+        let reader = FileReader::try_new(file, None).unwrap();
+        for sorted_batch in reader {
+            let sorted_batch = sorted_batch.unwrap();
+            let mut sort_arrays = vec![];
+            for e in self.expr.iter() {
+                let i = e.expr.index();
+                sort_arrays.push(sorted_batch.column(i).clone())
+            }
+            in_mem_batches.push(BatchWithSortArray {
+                sort_arrays,
+                sorted_batch,
+            });
+        }
+
+        cursor
+    }
+
     async fn serialize_for_suspend(&self, cursor: i32) {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .truncate(true)
             .create(true)
-            .open("suspend.log")
+            .open(SPILL_LOG_FILE)
             .unwrap();
         writeln!(file, "{}", cursor).unwrap();
 
         let mut spills = self.spills.lock().await;
-        writeln!(file, "{}", spills.len()).unwrap();
+        // writeln!(file, "{}", spills.len()).unwrap();
         for spill in spills.drain(..) {
             writeln!(file, "{}", spill.path()).unwrap();
         }
@@ -137,9 +188,9 @@ impl ExternalSorter {
             .write(true)
             .truncate(true)
             .create(true)
-            .open("intermediate.log")
+            .open(INMEM_LOG_FILE)
             .unwrap();
-        let path: PathBuf = "intermediate.log".into();
+        let path: PathBuf = INMEM_LOG_FILE.into();
         let mut writer = IPCWriter::new(&path, &self.schema).unwrap();
         for batch_with_sort_array in in_mem_batches.iter() {
             writer.write(&batch_with_sort_array.sorted_batch).unwrap();
@@ -962,18 +1013,28 @@ async fn do_sort(
     context.runtime_env().register_requester(sorter.id());
 
     let suspend_call = "suspend_call".to_string();
+
     let mut cursor = 0;
+
+    if sorter.suspend_exists() {
+        cursor = sorter.deserialize_for_resume().await;
+    }
+
+    let mut cnt = -1;
     while let Some(batch) = input.next().await {
+        cnt += 1;
+        if cnt < cursor {
+            continue;
+        }
         if !context.running() {
-            sorter.serialize_for_suspend(cursor).await;
+            sorter.serialize_for_suspend(cnt).await;
             return Err(DataFusionError::Execution(suspend_call));
         }
-        cursor += 1;
         let batch = batch?;
         sorter.insert_batch(batch, &tracking_metrics).await?;
     }
     if !context.running() {
-        sorter.serialize_for_suspend(cursor).await;
+        sorter.serialize_for_suspend(cnt).await;
         return Err(DataFusionError::Execution(suspend_call));
     }
     let result = sorter.sort().await;

@@ -570,6 +570,10 @@ macro_rules! compute_utf8_flag_op_scalar {
 }
 
 impl PhysicalExpr for BinaryExpr {
+    fn index(&self) -> usize {
+        panic!("Not implemented");
+        0
+    }
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self

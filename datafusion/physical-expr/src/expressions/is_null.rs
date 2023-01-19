@@ -57,6 +57,10 @@ impl std::fmt::Display for IsNullExpr {
 }
 
 impl PhysicalExpr for IsNullExpr {
+    fn index(&self) -> usize {
+        panic!("Not implemented");
+        0
+    }
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self

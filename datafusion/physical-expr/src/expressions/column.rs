@@ -69,6 +69,9 @@ impl std::fmt::Display for Column {
 }
 
 impl PhysicalExpr for Column {
+    fn index(&self) -> usize {
+        self.index
+    }
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn std::any::Any {
         self

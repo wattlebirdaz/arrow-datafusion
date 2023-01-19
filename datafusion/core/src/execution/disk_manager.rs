@@ -76,8 +76,8 @@ pub struct DiskManager {
 }
 
 pub struct NamedPersistentFile {
-    path: String,
-    file: File,
+    pub path: String,
+    pub file: File,
 }
 
 impl NamedPersistentFile {

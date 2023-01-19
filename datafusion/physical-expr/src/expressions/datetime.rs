@@ -109,6 +109,10 @@ impl Display for DateTimeIntervalExpr {
 }
 
 impl PhysicalExpr for DateTimeIntervalExpr {
+    fn index(&self) -> usize {
+        panic!("Not implemented");
+        0
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }

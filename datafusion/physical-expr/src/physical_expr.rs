@@ -32,6 +32,9 @@ use std::sync::Arc;
 /// Expression that can be evaluated against a RecordBatch
 /// A Physical expression knows its type, nullability and how to evaluate itself.
 pub trait PhysicalExpr: Send + Sync + Display + Debug + PartialEq<dyn Any> {
+    /// temporary index function
+    fn index(&self) -> usize;
+
     /// Returns the physical expression as [`Any`](std::any::Any) so that it can be
     /// downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any;
