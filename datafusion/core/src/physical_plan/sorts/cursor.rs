@@ -27,6 +27,7 @@ use std::cmp::Ordering;
 /// `SortKeyCursor::compare` can then be used to compare the sort key pointed to
 /// by this row cursor, with that of another `SortKeyCursor`. A cursor stores
 /// a row comparator for each other cursor that it is compared to.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SortKeyCursor {
     stream_idx: usize,
     cur_row: usize,

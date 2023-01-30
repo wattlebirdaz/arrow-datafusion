@@ -130,7 +130,7 @@ impl ExternalSorter {
         let mut cursor = 0;
         for (index, line) in reader.lines().enumerate() {
             let line = line.unwrap();
-            println!("{}, {}", index, line);
+            // println!("{}, {}", index, line);
             if index == 0 {
                 match line.parse::<i32>() {
                     Ok(i) => cursor = i,
@@ -245,7 +245,7 @@ impl ExternalSorter {
     }
 
     /// MergeSort in mem batches as well as spills into total order with `SortPreservingMergeStream`.
-    async fn sort(&self) -> Result<SendableRecordBatchStream> {
+    async fn sort(&self, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         let partition = self.partition_id();
         let batch_size = self.session_config.batch_size();
         let mut in_mem_batches = self.in_mem_batches.lock().await;
@@ -278,6 +278,7 @@ impl ExternalSorter {
                 .metrics_set
                 .new_final_tracking(partition, self.runtime.clone());
             Ok(Box::pin(SortPreservingMergeStream::new_from_streams(
+                context,
                 streams,
                 self.schema.clone(),
                 &self.expr,
@@ -1037,7 +1038,7 @@ async fn do_sort(
         sorter.serialize_for_suspend(cnt).await;
         return Err(DataFusionError::Execution(suspend_call));
     }
-    let result = sorter.sort().await;
+    let result = sorter.sort(context.clone()).await;
     debug!(
         "End do_sort for partition {} of context session_id {} and task_id {:?}",
         partition_id,

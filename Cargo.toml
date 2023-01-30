@@ -50,3 +50,8 @@ opt-level = 3
 overflow-checks = false
 panic = 'unwind'
 rpath = false
+
+[patch.crates-io]
+arrow = { path = "../arrow-rs/arrow" }
+arrow-buffer = { path = "../arrow-rs/arrow-buffer" }
+arrow-schema = { path = "../arrow-rs/arrow-schema" }

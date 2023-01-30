@@ -221,6 +221,7 @@ impl ExecutionPlan for SortPreservingMergeExec {
                 debug!("Done setting up sender-receiver for SortPreservingMergeExec::execute");
 
                 let result = Box::pin(SortPreservingMergeStream::new_from_streams(
+                    context.clone(),
                     receivers,
                     schema,
                     &self.expr,
@@ -285,8 +286,11 @@ impl MergingStreams {
     }
 }
 
-#[derive(Debug)]
+// #[derive(Debug)]
 pub(crate) struct SortPreservingMergeStream {
+    /// Task context
+    context: Arc<TaskContext>,
+
     /// The schema of the RecordBatches yielded by this stream
     schema: SchemaRef,
 
@@ -319,6 +323,7 @@ pub(crate) struct SortPreservingMergeStream {
     next_batch_id: usize,
 
     /// Heap that yields [`SortKeyCursor`] in increasing order
+    /// SERIALIZATION NEEDED
     heap: BinaryHeap<Reverse<SortKeyCursor>>,
 
     /// target batch size
@@ -329,7 +334,11 @@ pub(crate) struct SortPreservingMergeStream {
 }
 
 impl SortPreservingMergeStream {
+    pub fn serialize(&self) {
+        let data = serde_json::to_string(&self.heap).unwrap();
+    }
     pub(crate) fn new_from_streams(
+        context: Arc<TaskContext>,
         streams: Vec<SortedStream>,
         schema: SchemaRef,
         expressions: &[PhysicalSortExpr],
@@ -354,6 +363,7 @@ impl SortPreservingMergeStream {
         let row_converter = RowConverter::new(sort_fields);
 
         Ok(Self {
+            context,
             schema,
             batches,
             cursor_finished: vec![true; stream_count],
