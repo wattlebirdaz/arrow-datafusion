@@ -1022,18 +1022,32 @@ async fn do_sort(
     }
 
     let mut cnt = -1;
-    while let Some(batch) = input.next().await {
-        cnt += 1;
-        if cnt < cursor {
-            continue;
+
+    loop {
+        tokio::select! {
+            
+            _ = async {}, if !context.running() => {
+                sorter.serialize_for_suspend(cnt).await;
+                return Err(DataFusionError::Execution(suspend_call));
+            }
+
+            // Fallback expression used when the branch above is disabled
+            else => {
+                if let Some(batch) = input.next().await {
+                    cnt += 1;
+                    if cnt < cursor {
+                        continue;
+                    }
+                    let batch = batch?;
+                    sorter.insert_batch(batch, &tracking_metrics).await?;
+                } else {
+                    // no more inputs
+                    break;
+                }
+            }
         }
-        if !context.running() {
-            sorter.serialize_for_suspend(cnt).await;
-            return Err(DataFusionError::Execution(suspend_call));
-        }
-        let batch = batch?;
-        sorter.insert_batch(batch, &tracking_metrics).await?;
     }
+
     if !context.running() {
         sorter.serialize_for_suspend(cnt).await;
         return Err(DataFusionError::Execution(suspend_call));
