@@ -397,7 +397,7 @@ impl SortPreservingMergeStream {
         self.next_batch_id = bincode::deserialize_from(&f).unwrap();
         self.cursor_finished = bincode::deserialize_from(&f).unwrap();
         let reader = BufReader::new(f);
-        let mut spills = Vec::new();
+        self.spills.clear();
         for line in reader.lines() {
             let line = line.unwrap();
             let file = OpenOptions::new()
@@ -405,13 +405,9 @@ impl SortPreservingMergeStream {
                 .write(true)
                 .open(&line)
                 .unwrap();
-            spills.push(NamedPersistentFile { path: line, file })
+            self.spills.push(NamedPersistentFile { path: line, file })
         }
-        println!("spills: {}", spills.len());
-        assert!(self.spills.len() == spills.len());
-        for i in 0..self.spills.len() {
-            assert!(self.spills[i].path == spills[i].path);
-        }
+        println!("spills cnt: {}", self.spills.len());
     }
     pub(crate) fn new_from_streams(
         context: Arc<TaskContext>,
