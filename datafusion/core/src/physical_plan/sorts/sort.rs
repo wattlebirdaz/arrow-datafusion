@@ -269,16 +269,19 @@ impl ExternalSorter {
             }
 
             let mut spills = self.spills.lock().await;
+            let mut spill_files = Vec::new();
 
             for spill in spills.drain(..) {
-                let stream = read_spill_as_stream(spill, self.schema.clone())?;
+                let stream = read_spill_as_stream(&spill, self.schema.clone())?;
                 streams.push(SortedStream::new(stream, 0));
+                spill_files.push(spill);
             }
             let tracking_metrics = self
                 .metrics_set
                 .new_final_tracking(partition, self.runtime.clone());
             Ok(Box::pin(SortPreservingMergeStream::new_from_streams(
                 context,
+                spill_files,
                 streams,
                 self.schema.clone(),
                 &self.expr,
@@ -702,19 +705,19 @@ async fn spill_partial_sorted_stream(
 }
 
 fn read_spill_as_stream(
-    path: NamedPersistentFile,
+    path: &NamedPersistentFile,
     schema: SchemaRef,
 ) -> Result<SendableRecordBatchStream> {
     let (sender, receiver): (
         Sender<ArrowResult<RecordBatch>>,
         Receiver<ArrowResult<RecordBatch>>,
     ) = tokio::sync::mpsc::channel(2);
+    let path_str = path.path().clone();
     let join_handle = task::spawn_blocking(move || {
-        if let Err(e) = read_spill(sender, path.path()) {
+        if let Err(e) = read_spill(sender, &path_str) {
             error!(
                 "Failure while reading spill file: {:?}. Error: {}",
-                path.path(),
-                e
+                &path_str, e
             );
         }
     });

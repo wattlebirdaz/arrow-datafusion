@@ -16,6 +16,13 @@
 // under the License.
 
 //! Defines the sort preserving merge plan
+use crate::execution::disk_manager::NamedPersistentFile;
+use crate::physical_plan::common::IPCWriter;
+use std::fs::{File, OpenOptions};
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::Write;
+use std::path::PathBuf;
 
 use std::any::Any;
 use std::cmp::Reverse;
@@ -219,9 +226,11 @@ impl ExecutionPlan for SortPreservingMergeExec {
                 };
 
                 debug!("Done setting up sender-receiver for SortPreservingMergeExec::execute");
+                panic!("spills not defined");
 
                 let result = Box::pin(SortPreservingMergeStream::new_from_streams(
                     context.clone(),
+                    Vec::new(),
                     receivers,
                     schema,
                     &self.expr,
@@ -288,6 +297,15 @@ impl MergingStreams {
 
 // #[derive(Debug)]
 pub(crate) struct SortPreservingMergeStream {
+    /// Counter how many times poll is called
+    cnt: u64,
+
+    /// Writes output data
+    writer: IPCWriter,
+
+    /// Spills
+    spills: Vec<NamedPersistentFile>,
+
     /// Task context
     context: Arc<TaskContext>,
 
@@ -333,12 +351,71 @@ pub(crate) struct SortPreservingMergeStream {
     row_converter: RowConverter,
 }
 
+impl Drop for SortPreservingMergeStream {
+    fn drop(&mut self) {
+        println!("poll cnt: {}", self.cnt);
+        self.writer.finish().unwrap();
+    }
+}
+
 impl SortPreservingMergeStream {
     pub fn serialize(&self) {
-        let data = serde_json::to_string(&self.heap).unwrap();
+        println!("serializing");
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open("mergesort.data")
+            .unwrap();
+        let data = bincode::serialize(&self.heap).unwrap();
+        println!("heap: {}", data.len());
+        f.write_all(&data).unwrap();
+        let data = bincode::serialize(&self.in_progress).unwrap();
+        println!("in_progress: {}", data.len());
+        f.write_all(&data).unwrap();
+        let data = bincode::serialize(&self.next_batch_id).unwrap();
+        println!("next_batch_id: {}", data.len());
+        f.write_all(&data).unwrap();
+        let data = bincode::serialize(&self.cursor_finished).unwrap();
+        println!("cursor_finished: {}", data.len());
+        f.write_all(&data).unwrap();
+        for spill in &self.spills {
+            writeln!(f, "{}", spill.path()).unwrap();
+        }
+        println!("spills cnt: {}", self.spills.len());
+        f.sync_all().unwrap();
+    }
+
+    pub fn deserialize(&mut self) {
+        println!("deseralizing");
+        let f = OpenOptions::new()
+            .read(true)
+            .open("mergesort.data")
+            .unwrap();
+        self.heap = bincode::deserialize_from(&f).unwrap();
+        self.in_progress = bincode::deserialize_from(&f).unwrap();
+        self.next_batch_id = bincode::deserialize_from(&f).unwrap();
+        self.cursor_finished = bincode::deserialize_from(&f).unwrap();
+        let reader = BufReader::new(f);
+        let mut spills = Vec::new();
+        for line in reader.lines() {
+            let line = line.unwrap();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&line)
+                .unwrap();
+            spills.push(NamedPersistentFile { path: line, file })
+        }
+        println!("spills: {}", spills.len());
+        assert!(self.spills.len() == spills.len());
+        for i in 0..self.spills.len() {
+            assert!(self.spills[i].path == spills[i].path);
+        }
     }
     pub(crate) fn new_from_streams(
         context: Arc<TaskContext>,
+        spills: Vec<NamedPersistentFile>,
         streams: Vec<SortedStream>,
         schema: SchemaRef,
         expressions: &[PhysicalSortExpr],
@@ -362,7 +439,14 @@ impl SortPreservingMergeStream {
             .collect::<Result<Vec<_>>>()?;
         let row_converter = RowConverter::new(sort_fields);
 
+        let output_file = "./output.data";
+        let path: PathBuf = output_file.into();
+        let writer = IPCWriter::new(&path, &schema).unwrap();
+
         Ok(Self {
+            cnt: 0,
+            writer,
+            spills,
             context,
             schema,
             batches,
@@ -542,6 +626,12 @@ impl Stream for SortPreservingMergeStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
+        if self.cnt == 300 {
+            self.serialize();
+            self.deserialize();
+        }
+        // println!("poll count: {}", self.cnt);
+        self.cnt += 1;
         let poll = self.poll_next_inner(cx);
         self.tracking_metrics.record_poll(poll)
     }
@@ -597,7 +687,11 @@ impl SortPreservingMergeStream {
                     });
 
                     if self.in_progress.len() == self.batch_size {
-                        return Poll::Ready(Some(self.build_record_batch()));
+                        let res = self.build_record_batch();
+                        if let Ok(batch) = &res {
+                            self.writer.write(batch).unwrap();
+                        }
+                        return Poll::Ready(Some(res));
                     }
 
                     // If removed the last row from the cursor, need to fetch a new record
@@ -613,7 +707,13 @@ impl SortPreservingMergeStream {
                     }
                 }
                 None if self.in_progress.is_empty() => return Poll::Ready(None),
-                None => return Poll::Ready(Some(self.build_record_batch())),
+                None => {
+                    let res = self.build_record_batch();
+                    if let Ok(batch) = &res {
+                        self.writer.write(batch).unwrap();
+                    }
+                    return Poll::Ready(Some(res));
+                }
             }
         }
     }

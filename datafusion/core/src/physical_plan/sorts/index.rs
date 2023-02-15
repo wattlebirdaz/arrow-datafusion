@@ -49,7 +49,8 @@
 ///different number of
 ///   RecordBatches
 /// ```
-#[derive(Debug, Clone)]
+use serde::{Deserialize, Serialize};
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RowIndex {
     /// The index of the stream (uniquely identifies the stream)
     pub stream_idx: usize,
