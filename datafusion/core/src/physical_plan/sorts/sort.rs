@@ -251,6 +251,9 @@ impl ExternalSorter {
         let mut in_mem_batches = self.in_mem_batches.lock().await;
 
         if self.spilled_before().await {
+            // spill down the in-memory part to disk
+            self.spill().await?;
+
             let tracking_metrics = self
                 .metrics_set
                 .new_intermediate_tracking(partition, self.runtime.clone());
@@ -266,6 +269,9 @@ impl ExternalSorter {
                 )?;
                 let prev_used = self.free_all_memory();
                 streams.push(SortedStream::new(in_mem_stream, prev_used));
+            }
+            if in_mem_batches.len() != 0 {
+                panic!("in-memory part should be spilled");
             }
 
             let mut spills = self.spills.lock().await;
