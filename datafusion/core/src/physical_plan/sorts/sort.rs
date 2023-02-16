@@ -33,6 +33,7 @@ use crate::physical_plan::metrics::{
 };
 use crate::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeStream;
 use crate::physical_plan::sorts::SortedStream;
+use crate::physical_plan::sorts::{MERGE_SORT_DATA, PARTIAL_SORT_DATA, SPILL_DATA};
 use crate::physical_plan::stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter};
 use crate::physical_plan::{
     DisplayFormatType, Distribution, EmptyRecordBatchStream, ExecutionPlan, Partitioning,
@@ -45,6 +46,7 @@ use arrow::compute::{concat, lexsort_to_indices, take, SortColumn, TakeOptions};
 use arrow::datatypes::SchemaRef;
 use arrow::error::{ArrowError, Result as ArrowResult};
 use arrow::ipc::reader::FileReader;
+use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use futures::lock::Mutex;
@@ -75,9 +77,6 @@ use std::io::{self, Write};
 /// 2.2 if the memory threshold is reached, sort all buffered batches and spill to file.
 ///     buffer the batch in memory, go to 1.
 /// 3. when input is exhausted, merge all in memory batches and spills to get a total order.
-
-const SPILL_LOG_FILE: &str = "spill.log";
-const INMEM_LOG_FILE: &str = "inmem.log";
 
 struct ExternalSorter {
     id: MemoryConsumerId,
@@ -118,37 +117,40 @@ impl ExternalSorter {
         }
     }
 
-    fn suspend_exists(&self) -> bool {
-        std::path::Path::new(SPILL_LOG_FILE).exists()
-            && std::path::Path::new(INMEM_LOG_FILE).exists()
+    fn is_suspended_at_partial_sort(&self) -> bool {
+        std::path::Path::new(PARTIAL_SORT_DATA).exists()
+            && std::path::Path::new(SPILL_DATA).exists()
     }
 
-    async fn deserialize_for_resume(&self) -> i32 {
-        let file = OpenOptions::new().read(true).open(SPILL_LOG_FILE).unwrap();
-        let reader = BufReader::new(file);
+    fn is_suspended_at_merge_sort(&self) -> bool {
+        std::path::Path::new(MERGE_SORT_DATA).exists()
+    }
+
+    async fn deserialize_partial_sort(&self) -> i32 {
+        let f = OpenOptions::new().read(true).open(SPILL_DATA).unwrap();
+
+        let cursor: i32 = bincode::deserialize_from(&f).unwrap();
+
+        let num_spills: usize = bincode::deserialize_from(&f).unwrap();
+
         let mut spills = self.spills.lock().await;
-        let mut cursor = 0;
-        for (index, line) in reader.lines().enumerate() {
-            let line = line.unwrap();
-            // println!("{}, {}", index, line);
-            if index == 0 {
-                match line.parse::<i32>() {
-                    Ok(i) => cursor = i,
-                    Err(_) => panic!("Read {}", SPILL_LOG_FILE),
-                }
-            } else {
-                let file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&line)
-                    .unwrap();
-                spills.push(NamedPersistentFile { path: line, file });
-            }
+        spills.clear();
+        for _ in 0..num_spills {
+            let path: String = bincode::deserialize_from(&f).unwrap();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            spills.push(NamedPersistentFile { path, file });
         }
 
         let mut in_mem_batches = self.in_mem_batches.lock().await;
-        let file = BufReader::new(File::open(INMEM_LOG_FILE).unwrap());
-        let reader = FileReader::try_new(file, None).unwrap();
+        let f = OpenOptions::new()
+            .read(true)
+            .open(PARTIAL_SORT_DATA)
+            .unwrap();
+        let reader = FileReader::try_new(f, None).unwrap();
         for sorted_batch in reader {
             let sorted_batch = sorted_batch.unwrap();
             let mut sort_arrays = vec![];
@@ -161,37 +163,39 @@ impl ExternalSorter {
                 sorted_batch,
             });
         }
-
         cursor
     }
 
-    async fn serialize_for_suspend(&self, cursor: i32) {
-        let mut file = OpenOptions::new()
-            .read(true)
+    async fn serialize_partial_sort(&self, cursor: i32) {
+        let mut f = OpenOptions::new()
             .write(true)
             .truncate(true)
             .create(true)
-            .open(SPILL_LOG_FILE)
+            .open(SPILL_DATA)
             .unwrap();
-        writeln!(file, "{}", cursor).unwrap();
+        // cursor tells you which batch you have read already
+        let data = bincode::serialize(&cursor).unwrap();
+        f.write_all(&data).unwrap();
 
         let mut spills = self.spills.lock().await;
-        // writeln!(file, "{}", spills.len()).unwrap();
+        let len: usize = spills.len();
+        let data = bincode::serialize(&len).unwrap();
+        f.write_all(&data).unwrap();
         for spill in spills.drain(..) {
-            writeln!(file, "{}", spill.path()).unwrap();
+            let data = bincode::serialize(spill.path()).unwrap();
+            f.write_all(&data).unwrap();
         }
-        file.sync_all().unwrap();
+        f.sync_all().unwrap();
 
-        let in_mem_batches = self.in_mem_batches.lock().await;
-        OpenOptions::new()
-            .read(true)
+        let f = OpenOptions::new()
             .write(true)
             .truncate(true)
             .create(true)
-            .open(INMEM_LOG_FILE)
+            .open(PARTIAL_SORT_DATA)
             .unwrap();
-        let path: PathBuf = INMEM_LOG_FILE.into();
-        let mut writer = IPCWriter::new(&path, &self.schema).unwrap();
+        let mut writer = FileWriter::try_new(f, &self.schema).unwrap();
+        // write the batches that are sorted to memory
+        let in_mem_batches = self.in_mem_batches.lock().await;
         for batch_with_sort_array in in_mem_batches.iter() {
             writer.write(&batch_with_sort_array.sorted_batch).unwrap();
         }
@@ -248,11 +252,11 @@ impl ExternalSorter {
     async fn sort(&self, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         let partition = self.partition_id();
         let batch_size = self.session_config.batch_size();
-        let mut in_mem_batches = self.in_mem_batches.lock().await;
 
         if self.spilled_before().await {
             // spill down the in-memory part to disk
             self.spill().await?;
+            let mut in_mem_batches = self.in_mem_batches.lock().await;
 
             let tracking_metrics = self
                 .metrics_set
@@ -285,7 +289,7 @@ impl ExternalSorter {
             let tracking_metrics = self
                 .metrics_set
                 .new_final_tracking(partition, self.runtime.clone());
-            Ok(Box::pin(SortPreservingMergeStream::new_from_streams(
+            return Ok(Box::pin(SortPreservingMergeStream::new_from_streams(
                 context,
                 spill_files,
                 streams,
@@ -293,8 +297,11 @@ impl ExternalSorter {
                 &self.expr,
                 tracking_metrics,
                 self.session_config.batch_size(),
-            )?))
-        } else if in_mem_batches.len() > 0 {
+            )?));
+        }
+
+        let mut in_mem_batches = self.in_mem_batches.lock().await;
+        if in_mem_batches.len() > 0 {
             let tracking_metrics = self
                 .metrics_set
                 .new_final_tracking(partition, self.runtime.clone());
@@ -1026,8 +1033,8 @@ async fn do_sort(
 
     let mut cursor = 0;
 
-    if sorter.suspend_exists() {
-        cursor = sorter.deserialize_for_resume().await;
+    if sorter.is_suspended_at_partial_sort() {
+        cursor = sorter.deserialize_partial_sort().await;
     }
 
     let mut cnt = -1;
@@ -1037,14 +1044,14 @@ async fn do_sort(
             continue;
         }
         if !context.running() {
-            sorter.serialize_for_suspend(cnt).await;
+            sorter.serialize_partial_sort(cnt).await;
             return Err(DataFusionError::Execution(suspend_call));
         }
         let batch = batch?;
         sorter.insert_batch(batch, &tracking_metrics).await?;
     }
     if !context.running() {
-        sorter.serialize_for_suspend(cnt).await;
+        sorter.serialize_partial_sort(cnt).await;
         return Err(DataFusionError::Execution(suspend_call));
     }
     let result = sorter.sort(context.clone()).await;

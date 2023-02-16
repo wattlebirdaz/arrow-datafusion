@@ -44,3 +44,8 @@ impl SortedStream {
         Self { stream, mem_used }
     }
 }
+
+pub const PARTIAL_SORT_DATA: &str = "partial_sort.log";
+pub const SPILL_DATA: &str = "spill.log";
+pub const MERGE_SORT_DATA: &str = "merge_sort.log";
+pub const OUTPUT_DATA: &str = "sort_output.log";

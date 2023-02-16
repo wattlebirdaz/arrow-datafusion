@@ -50,6 +50,7 @@ use crate::physical_plan::metrics::{
     ExecutionPlanMetricsSet, MemTrackingMetrics, MetricsSet,
 };
 use crate::physical_plan::sorts::{RowIndex, SortKeyCursor, SortedStream};
+use crate::physical_plan::sorts::{MERGE_SORT_DATA, OUTPUT_DATA};
 use crate::physical_plan::stream::RecordBatchReceiverStream;
 use crate::physical_plan::{
     common::spawn_execution, expressions::PhysicalSortExpr, DisplayFormatType,
@@ -368,7 +369,7 @@ impl SortPreservingMergeStream {
             .write(true)
             .create(true)
             .truncate(true)
-            .open("mergesort.data")
+            .open(MERGE_SORT_DATA)
             .unwrap();
 
         let data = bincode::serialize(&self.heap).unwrap();
@@ -400,10 +401,7 @@ impl SortPreservingMergeStream {
 
     pub fn deserialize(&mut self) {
         println!("deseralizing");
-        let f = OpenOptions::new()
-            .read(true)
-            .open("mergesort.data")
-            .unwrap();
+        let f = OpenOptions::new().read(true).open(MERGE_SORT_DATA).unwrap();
         self.heap = bincode::deserialize_from(&f).unwrap();
         self.in_progress = bincode::deserialize_from(&f).unwrap();
         self.next_batch_id = bincode::deserialize_from(&f).unwrap();
@@ -448,8 +446,7 @@ impl SortPreservingMergeStream {
             .collect::<Result<Vec<_>>>()?;
         let row_converter = RowConverter::new(sort_fields);
 
-        let output_file = "./output.data";
-        let path: PathBuf = output_file.into();
+        let path: PathBuf = OUTPUT_DATA.into();
         let writer = IPCWriter::new(&path, &schema).unwrap();
 
         let mut batch_id_keeper: Vec<(usize, usize)> = Vec::new();
@@ -643,10 +640,10 @@ impl Stream for SortPreservingMergeStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        if self.cnt == 300 {
-            self.serialize();
-            self.deserialize();
-        }
+        // if self.cnt == 300 {
+        //     self.serialize();
+        //     self.deserialize();
+        // }
         // println!("poll count: {}", self.cnt);
         self.cnt += 1;
         let poll = self.poll_next_inner(cx);
