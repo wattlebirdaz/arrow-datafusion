@@ -306,6 +306,9 @@ pub(crate) struct SortPreservingMergeStream {
     /// Spills
     spills: Vec<NamedPersistentFile>,
 
+    /// BatchID Keeper: contains batch_id_keeper[idx] contains [batch_id_from, batch_id_to) of stream idx
+    batch_id_keeper: Vec<(usize, usize)>,
+
     /// Task context
     context: Arc<TaskContext>,
 
@@ -367,18 +370,27 @@ impl SortPreservingMergeStream {
             .truncate(true)
             .open("mergesort.data")
             .unwrap();
+
         let data = bincode::serialize(&self.heap).unwrap();
         println!("heap: {}", data.len());
         f.write_all(&data).unwrap();
+
         let data = bincode::serialize(&self.in_progress).unwrap();
         println!("in_progress: {}", data.len());
         f.write_all(&data).unwrap();
+
         let data = bincode::serialize(&self.next_batch_id).unwrap();
         println!("next_batch_id: {}", data.len());
         f.write_all(&data).unwrap();
+
         let data = bincode::serialize(&self.cursor_finished).unwrap();
         println!("cursor_finished: {}", data.len());
         f.write_all(&data).unwrap();
+
+        let data = bincode::serialize(&self.batch_id_keeper).unwrap();
+        println!("batch_id_keeper: {}", data.len());
+        f.write_all(&data).unwrap();
+
         for spill in &self.spills {
             writeln!(f, "{}", spill.path()).unwrap();
         }
@@ -396,6 +408,7 @@ impl SortPreservingMergeStream {
         self.in_progress = bincode::deserialize_from(&f).unwrap();
         self.next_batch_id = bincode::deserialize_from(&f).unwrap();
         self.cursor_finished = bincode::deserialize_from(&f).unwrap();
+        self.batch_id_keeper = bincode::deserialize_from(&f).unwrap();
         let reader = BufReader::new(f);
         self.spills.clear();
         for line in reader.lines() {
@@ -439,10 +452,16 @@ impl SortPreservingMergeStream {
         let path: PathBuf = output_file.into();
         let writer = IPCWriter::new(&path, &schema).unwrap();
 
+        let mut batch_id_keeper: Vec<(usize, usize)> = Vec::new();
+        for _ in 0..stream_count {
+            batch_id_keeper.push((0, 0));
+        }
+
         Ok(Self {
             cnt: 0,
             writer,
             spills,
+            batch_id_keeper,
             context,
             schema,
             batches,
@@ -511,7 +530,8 @@ impl SortPreservingMergeStream {
                         self.next_batch_id += 1;
                         self.heap.push(Reverse(cursor));
                         self.cursor_finished[idx] = false;
-                        self.batches[idx].push_back(batch)
+                        self.batches[idx].push_back(batch);
+                        self.batch_id_keeper[idx].1 += 1;
                     } else {
                         empty_batch = true;
                     }
@@ -604,10 +624,11 @@ impl SortPreservingMergeStream {
         // any RowIndex's reliant on the batch indexes
         //
         // We can therefore drop all but the last batch for each stream
-        for batches in &mut self.batches {
+        for (stream_id, batches) in self.batches.iter_mut().enumerate() {
             if batches.len() > 1 {
                 // Drain all but the last batch
                 batches.drain(0..(batches.len() - 1));
+                self.batch_id_keeper[stream_id].0 = self.batch_id_keeper[stream_id].1 - 1;
             }
         }
 
