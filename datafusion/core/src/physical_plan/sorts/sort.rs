@@ -248,6 +248,25 @@ impl ExternalSorter {
         !spills.is_empty()
     }
 
+    async fn resume_merge_sort(
+        &self,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let partition = self.partition_id();
+        let tracking_metrics = self
+            .metrics_set
+            .new_final_tracking(partition, self.runtime.clone());
+        let stream = SortPreservingMergeStream::new_for_resume(
+            context,
+            self.schema.clone(),
+            &self.expr,
+            tracking_metrics,
+            self.session_config.batch_size(),
+        )
+        .unwrap();
+        return Ok(Box::pin(stream));
+    }
+
     /// MergeSort in mem batches as well as spills into total order with `SortPreservingMergeStream`.
     async fn sort(&self, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         let partition = self.partition_id();
@@ -1035,6 +1054,9 @@ async fn do_sort(
 
     if sorter.is_suspended_at_partial_sort() {
         cursor = sorter.deserialize_partial_sort().await;
+    } else if sorter.is_suspended_at_merge_sort() {
+        let result = sorter.resume_merge_sort(context.clone()).await;
+        return result;
     }
 
     let mut cnt = -1;

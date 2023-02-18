@@ -140,6 +140,20 @@ impl DiskManager {
             .unwrap();
         Ok(NamedPersistentFile { path, file })
     }
+    /// Return a persistent file from a randomized choice in the current directory
+    pub fn create_output_file() -> Result<NamedPersistentFile> {
+        let local_dirs = String::from("./output/");
+        let mut rng = rand::thread_rng();
+        let x: u64 = rng.gen();
+        let path = local_dirs + &x.to_string();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        Ok(NamedPersistentFile { path, file })
+    }
 }
 
 /// Setup local dirs by creating one new dir in each of the given dirs

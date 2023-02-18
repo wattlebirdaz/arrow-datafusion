@@ -16,8 +16,10 @@
 // under the License.
 
 //! Defines the sort preserving merge plan
-use crate::execution::disk_manager::NamedPersistentFile;
+use crate::execution::disk_manager::{DiskManager, NamedPersistentFile};
 use crate::physical_plan::common::IPCWriter;
+use arrow::ipc::reader::FileReader;
+use rand::{thread_rng, Rng};
 use std::fs::{File, OpenOptions};
 use std::io::BufRead;
 use std::io::BufReader;
@@ -31,7 +33,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use arrow::datatypes::Schema;
 use arrow::error::ArrowError;
+use arrow::ipc::writer::FileWriter;
 use arrow::row::{RowConverter, SortField};
 use arrow::{
     array::{make_array as make_arrow_array, MutableArrayData},
@@ -57,6 +61,57 @@ use crate::physical_plan::{
     Distribution, ExecutionPlan, Partitioning, PhysicalExpr, RecordBatchStream,
     SendableRecordBatchStream, Statistics,
 };
+
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::task;
+
+fn read_spill_as_stream(
+    path: &NamedPersistentFile,
+    schema: &SchemaRef,
+    batches: &mut VecDeque<RecordBatch>,
+    batch_id_start: usize,
+    batch_id_end: usize,
+) -> Result<SendableRecordBatchStream> {
+    let file = OpenOptions::new().read(true).open(path.path()).unwrap();
+    let mut reader = FileReader::try_new(file, None)?;
+    reader.set_index(batch_id_start).unwrap();
+    for _ in batch_id_start..batch_id_end {
+        if let Some(batch) = reader.next() {
+            let batch = batch.unwrap();
+            batches.push_back(batch);
+        } else {
+            panic!("failed to load batch for resume");
+        }
+    }
+    dbg!(batches);
+    let (sender, receiver): (
+        Sender<ArrowResult<RecordBatch>>,
+        Receiver<ArrowResult<RecordBatch>>,
+    ) = tokio::sync::mpsc::channel(2);
+
+    let join_handle = task::spawn_blocking(move || {
+        if let Err(e) = read_spill(sender, reader) {
+            panic!("Failure while resuming reading of spill file --- {:?}", e);
+        }
+    });
+    Ok(RecordBatchReceiverStream::create(
+        &schema,
+        receiver,
+        join_handle,
+    ))
+}
+
+fn read_spill(
+    sender: Sender<ArrowResult<RecordBatch>>,
+    reader: FileReader<File>,
+) -> Result<()> {
+    for batch in reader {
+        sender
+            .blocking_send(batch)
+            .map_err(|e| DataFusionError::Execution(format!("{}", e)))?;
+    }
+    Ok(())
+}
 
 /// Sort preserving merge execution plan
 ///
@@ -302,7 +357,14 @@ pub(crate) struct SortPreservingMergeStream {
     cnt: u64,
 
     /// Writes output data
-    writer: IPCWriter,
+    writer: FileWriter<File>,
+
+    /// Files of the output
+    outputs: Vec<String>,
+    /// FIle output count
+    output_reader: Vec<FileReader<File>>,
+    /// reader index
+    reader_idx: usize,
 
     /// Spills
     spills: Vec<NamedPersistentFile>,
@@ -372,6 +434,10 @@ impl SortPreservingMergeStream {
             .open(MERGE_SORT_DATA)
             .unwrap();
 
+        let data = bincode::serialize(&self.outputs).unwrap();
+        println!("outputs files: {}", data.len());
+        f.write_all(&data).unwrap();
+
         let data = bincode::serialize(&self.heap).unwrap();
         println!("heap: {}", data.len());
         f.write_all(&data).unwrap();
@@ -402,6 +468,7 @@ impl SortPreservingMergeStream {
     pub fn deserialize(&mut self) {
         println!("deseralizing");
         let f = OpenOptions::new().read(true).open(MERGE_SORT_DATA).unwrap();
+        self.outputs = bincode::deserialize_from(&f).unwrap();
         self.heap = bincode::deserialize_from(&f).unwrap();
         self.in_progress = bincode::deserialize_from(&f).unwrap();
         self.next_batch_id = bincode::deserialize_from(&f).unwrap();
@@ -419,6 +486,97 @@ impl SortPreservingMergeStream {
             self.spills.push(NamedPersistentFile { path: line, file })
         }
         println!("spills cnt: {}", self.spills.len());
+    }
+
+    pub(crate) fn new_for_resume(
+        context: Arc<TaskContext>,
+        schema: SchemaRef,
+        expressions: &[PhysicalSortExpr],
+        tracking_metrics: MemTrackingMetrics,
+        batch_size: usize,
+    ) -> Result<Self> {
+        let f = OpenOptions::new().read(true).open(MERGE_SORT_DATA).unwrap();
+        let mut outputs: Vec<String> = bincode::deserialize_from(&f).unwrap();
+        let heap = bincode::deserialize_from(&f).unwrap();
+        let in_progress = bincode::deserialize_from(&f).unwrap();
+        let next_batch_id = bincode::deserialize_from(&f).unwrap();
+        let cursor_finished = bincode::deserialize_from(&f).unwrap();
+        let batch_id_keeper: Vec<(usize, usize)> = bincode::deserialize_from(&f).unwrap();
+
+        let mut spills = Vec::new();
+        let reader = BufReader::new(f);
+        for line in reader.lines() {
+            let line = line.unwrap();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&line)
+                .unwrap();
+            spills.push(NamedPersistentFile { path: line, file })
+        }
+        println!("spills cnt: {}", spills.len());
+        let stream_count = spills.len();
+        let mut streams = Vec::new();
+        let mut batches: Vec<VecDeque<RecordBatch>> = (0..stream_count)
+            .into_iter()
+            .map(|_| VecDeque::new())
+            .collect();
+        for i in 0..stream_count {
+            let stream = read_spill_as_stream(
+                &spills[i],
+                &schema,
+                &mut batches[i],
+                batch_id_keeper[i].0,
+                batch_id_keeper[i].1,
+            )
+            .unwrap();
+            streams.push(SortedStream::new(stream, 0).stream.fuse());
+        }
+
+        tracking_metrics.init_mem_used(0);
+
+        let sort_fields = expressions
+            .iter()
+            .map(|expr| {
+                let data_type = expr.expr.data_type(&schema)?;
+                Ok(SortField::new_with_options(data_type, expr.options))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let row_converter = RowConverter::new(sort_fields);
+
+        let mut output_reader = Vec::new();
+        for path in outputs.iter() {
+            let f = OpenOptions::new().read(true).open(path).unwrap();
+            let reader = FileReader::try_new(f, None).unwrap();
+            output_reader.push(reader);
+        }
+
+        let persistent_file = DiskManager::create_output_file().unwrap();
+        let writer = FileWriter::try_new(persistent_file.file, &schema).unwrap();
+        outputs.push(persistent_file.path);
+
+        Ok(Self {
+            cnt: 0,
+            writer,
+            outputs,
+            output_reader,
+            reader_idx: 0,
+            spills,
+            batch_id_keeper,
+            context,
+            schema,
+            batches,
+            cursor_finished,
+            streams: MergingStreams::new(streams),
+            column_expressions: expressions.iter().map(|x| x.expr.clone()).collect(),
+            tracking_metrics,
+            aborted: false,
+            in_progress,
+            next_batch_id,
+            heap,
+            batch_size,
+            row_converter,
+        })
     }
     pub(crate) fn new_from_streams(
         context: Arc<TaskContext>,
@@ -446,8 +604,10 @@ impl SortPreservingMergeStream {
             .collect::<Result<Vec<_>>>()?;
         let row_converter = RowConverter::new(sort_fields);
 
-        let path: PathBuf = OUTPUT_DATA.into();
-        let writer = IPCWriter::new(&path, &schema).unwrap();
+        let persistent_file = DiskManager::create_output_file().unwrap();
+        let writer = FileWriter::try_new(persistent_file.file, &schema).unwrap();
+        let mut outputs = Vec::new();
+        outputs.push(persistent_file.path);
 
         let mut batch_id_keeper: Vec<(usize, usize)> = Vec::new();
         for _ in 0..stream_count {
@@ -457,6 +617,9 @@ impl SortPreservingMergeStream {
         Ok(Self {
             cnt: 0,
             writer,
+            outputs,
+            output_reader: Vec::new(),
+            reader_idx: 0,
             spills,
             batch_id_keeper,
             context,
@@ -642,12 +805,25 @@ impl Stream for SortPreservingMergeStream {
     ) -> Poll<Option<Self::Item>> {
         // if self.cnt == 300 {
         //     self.serialize();
-        //     self.deserialize();
+        //     let suspend_at_merge = "suspend_at_merge".to_string();
+        //     panic!("suspended at merge");
         // }
-        // println!("poll count: {}", self.cnt);
         self.cnt += 1;
-        let poll = self.poll_next_inner(cx);
-        self.tracking_metrics.record_poll(poll)
+        // println!("poll count: {}", self.cnt);
+        loop {
+            if self.reader_idx == self.output_reader.len() {
+                let poll = self.poll_next_inner(cx);
+                return self.tracking_metrics.record_poll(poll);
+            }
+            let reader_idx = self.reader_idx;
+            let reader = &mut self.output_reader[reader_idx];
+            if let Some(batch) = reader.next() {
+                let poll = Poll::Ready(Some(batch));
+                return self.tracking_metrics.record_poll(poll);
+            } else {
+                self.reader_idx += 1;
+            }
+        }
     }
 }
 
