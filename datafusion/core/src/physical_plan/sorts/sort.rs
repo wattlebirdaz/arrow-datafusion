@@ -61,6 +61,7 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task;
 
@@ -1028,6 +1029,7 @@ async fn do_sort(
     context: Arc<TaskContext>,
     fetch: Option<usize>,
 ) -> Result<SendableRecordBatchStream> {
+    let start = Instant::now();
     debug!(
         "Start do_sort for partition {} of context session_id {} and task_id {:?}",
         partition_id,
@@ -1076,6 +1078,8 @@ async fn do_sort(
         sorter.serialize_partial_sort(cnt).await;
         return Err(DataFusionError::Execution(suspend_call));
     }
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    println!("Generating the runs: {}", elapsed);
     let result = sorter.sort(context.clone()).await;
     debug!(
         "End do_sort for partition {} of context session_id {} and task_id {:?}",

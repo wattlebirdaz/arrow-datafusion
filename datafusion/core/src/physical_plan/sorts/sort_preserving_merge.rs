@@ -425,7 +425,7 @@ impl Drop for SortPreservingMergeStream {
 }
 
 impl SortPreservingMergeStream {
-    pub fn serialize(&self) {
+    fn serialize(&self) {
         println!("serializing");
         let mut f = OpenOptions::new()
             .write(true)
@@ -465,7 +465,7 @@ impl SortPreservingMergeStream {
         f.sync_all().unwrap();
     }
 
-    pub fn deserialize(&mut self) {
+    fn deserialize(&mut self) {
         println!("deseralizing");
         let f = OpenOptions::new().read(true).open(MERGE_SORT_DATA).unwrap();
         self.outputs = bincode::deserialize_from(&f).unwrap();
@@ -803,11 +803,11 @@ impl Stream for SortPreservingMergeStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        // if !self.context.running() {
-        // // if self.cnt == 300 {
-        //     self.serialize();
-        //     return Poll::Ready(None);
-        // }
+        if !self.context.running() {
+            // if self.cnt == 3000 {
+            self.serialize();
+            return Poll::Ready(None);
+        }
         self.cnt += 1;
         // println!("poll count: {}", self.cnt);
         loop {
