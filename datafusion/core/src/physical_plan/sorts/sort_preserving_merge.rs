@@ -83,7 +83,7 @@ fn read_spill_as_stream(
             panic!("failed to load batch for resume");
         }
     }
-    dbg!(batches);
+    // dbg!(batches);
     let (sender, receiver): (
         Sender<ArrowResult<RecordBatch>>,
         Receiver<ArrowResult<RecordBatch>>,
@@ -803,10 +803,10 @@ impl Stream for SortPreservingMergeStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        // if self.cnt == 300 {
+        // if !self.context.running() {
+        // // if self.cnt == 300 {
         //     self.serialize();
-        //     let suspend_at_merge = "suspend_at_merge".to_string();
-        //     panic!("suspended at merge");
+        //     return Poll::Ready(None);
         // }
         self.cnt += 1;
         // println!("poll count: {}", self.cnt);
