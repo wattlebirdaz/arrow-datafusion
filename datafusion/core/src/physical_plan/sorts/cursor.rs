@@ -61,6 +61,21 @@ impl SortKeyCursor {
         }
     }
 
+    pub fn new_with_cursor(
+        stream_idx: usize,
+        batch_id: usize,
+        cursor_id: usize,
+        rows: Rows,
+    ) -> Self {
+        Self {
+            stream_idx,
+            cur_row: cursor_id,
+            num_rows: rows.num_rows(),
+            batch_id,
+            rows,
+        }
+    }
+
     #[inline(always)]
     /// Return the stream index of this cursor
     pub fn stream_idx(&self) -> usize {

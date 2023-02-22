@@ -63,26 +63,16 @@ use crate::physical_plan::{
 };
 
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::task;
+use tokio::{stream, task};
 
 fn read_spill_as_stream(
     path: &NamedPersistentFile,
     schema: &SchemaRef,
-    batches: &mut VecDeque<RecordBatch>,
-    batch_id_start: usize,
-    batch_id_end: usize,
+    batch_id: usize,
 ) -> Result<SendableRecordBatchStream> {
     let file = OpenOptions::new().read(true).open(path.path()).unwrap();
     let mut reader = FileReader::try_new(file, None)?;
-    reader.set_index(batch_id_start).unwrap();
-    for _ in batch_id_start..batch_id_end {
-        if let Some(batch) = reader.next() {
-            let batch = batch.unwrap();
-            batches.push_back(batch);
-        } else {
-            panic!("failed to load batch for resume");
-        }
-    }
+    reader.set_index(batch_id).unwrap();
     // dbg!(batches);
     let (sender, receiver): (
         Sender<ArrowResult<RecordBatch>>,
@@ -356,6 +346,9 @@ pub(crate) struct SortPreservingMergeStream {
     /// Counter how many times poll is called
     cnt: u64,
 
+    /// counter of how many times build_record_count is called
+    build_record_count: u64,
+
     /// Writes output data
     writer: FileWriter<File>,
 
@@ -369,9 +362,6 @@ pub(crate) struct SortPreservingMergeStream {
     /// Spills
     spills: Vec<NamedPersistentFile>,
 
-    /// BatchID Keeper: contains batch_id_keeper[idx] contains [batch_id_from, batch_id_to) of stream idx
-    batch_id_keeper: Vec<(usize, usize)>,
-
     /// Task context
     context: Arc<TaskContext>,
 
@@ -380,6 +370,9 @@ pub(crate) struct SortPreservingMergeStream {
 
     /// The sorted input streams to merge together
     streams: MergingStreams,
+
+    /// number of batches read for each stream
+    batch_num_read: Vec<usize>,
 
     /// For each input stream maintain a dequeue of RecordBatches
     ///
@@ -392,7 +385,10 @@ pub(crate) struct SortPreservingMergeStream {
     cursor_finished: Vec<bool>,
 
     /// The accumulated row indexes for the next record batch
-    in_progress: Vec<RowIndex>,
+    in_progress: Vec<(RowIndex, usize)>,
+
+    /// The last (batch_id, cursor) of each stream that has already returned as output
+    last_batch_and_cursor_id: Vec<(usize, i64)>,
 
     /// The physical expressions to sort by
     column_expressions: Vec<Arc<dyn PhysicalExpr>>,
@@ -420,6 +416,11 @@ pub(crate) struct SortPreservingMergeStream {
 impl Drop for SortPreservingMergeStream {
     fn drop(&mut self) {
         println!("poll cnt: {}", self.cnt);
+        println!("build record count: {}", self.build_record_count);
+        println!(
+            "build record count X batch size: {}",
+            self.build_record_count * self.batch_size as u64
+        );
         self.writer.finish().unwrap();
     }
 }
@@ -434,29 +435,33 @@ impl SortPreservingMergeStream {
             .open(MERGE_SORT_DATA)
             .unwrap();
 
+        let data = bincode::serialize(&self.last_batch_and_cursor_id).unwrap();
+        println!("last_batch_and_cursor_id: {}", data.len());
+        f.write_all(&data).unwrap();
+
         let data = bincode::serialize(&self.outputs).unwrap();
         println!("outputs files: {}", data.len());
         f.write_all(&data).unwrap();
 
-        let data = bincode::serialize(&self.heap).unwrap();
-        println!("heap: {}", data.len());
-        f.write_all(&data).unwrap();
+        // let data = bincode::serialize(&self.heap).unwrap();
+        // println!("heap: {}", data.len());
+        // f.write_all(&data).unwrap();
 
-        let data = bincode::serialize(&self.in_progress).unwrap();
-        println!("in_progress: {}", data.len());
-        f.write_all(&data).unwrap();
+        // let data = bincode::serialize(&self.in_progress).unwrap();
+        // println!("in_progress: {}", data.len());
+        // f.write_all(&data).unwrap();
 
-        let data = bincode::serialize(&self.next_batch_id).unwrap();
-        println!("next_batch_id: {}", data.len());
-        f.write_all(&data).unwrap();
+        // let data = bincode::serialize(&self.next_batch_id).unwrap();
+        // println!("next_batch_id: {}", data.len());
+        // f.write_all(&data).unwrap();
 
-        let data = bincode::serialize(&self.cursor_finished).unwrap();
-        println!("cursor_finished: {}", data.len());
-        f.write_all(&data).unwrap();
+        // let data = bincode::serialize(&self.cursor_finished).unwrap();
+        // println!("cursor_finished: {}", data.len());
+        // f.write_all(&data).unwrap();
 
-        let data = bincode::serialize(&self.batch_id_keeper).unwrap();
-        println!("batch_id_keeper: {}", data.len());
-        f.write_all(&data).unwrap();
+        // let data = bincode::serialize(&self.batch_id_keeper).unwrap();
+        // println!("batch_id_keeper: {}", data.len());
+        // f.write_all(&data).unwrap();
 
         for spill in &self.spills {
             writeln!(f, "{}", spill.path()).unwrap();
@@ -468,12 +473,13 @@ impl SortPreservingMergeStream {
     fn deserialize(&mut self) {
         println!("deseralizing");
         let f = OpenOptions::new().read(true).open(MERGE_SORT_DATA).unwrap();
+        self.last_batch_and_cursor_id = bincode::deserialize_from(&f).unwrap();
         self.outputs = bincode::deserialize_from(&f).unwrap();
-        self.heap = bincode::deserialize_from(&f).unwrap();
-        self.in_progress = bincode::deserialize_from(&f).unwrap();
-        self.next_batch_id = bincode::deserialize_from(&f).unwrap();
-        self.cursor_finished = bincode::deserialize_from(&f).unwrap();
-        self.batch_id_keeper = bincode::deserialize_from(&f).unwrap();
+        // self.heap = bincode::deserialize_from(&f).unwrap();
+        // self.in_progress = bincode::deserialize_from(&f).unwrap();
+        // self.next_batch_id = bincode::deserialize_from(&f).unwrap();
+        // self.cursor_finished = bincode::deserialize_from(&f).unwrap();
+        // self.batch_id_keeper = bincode::deserialize_from(&f).unwrap();
         let reader = BufReader::new(f);
         self.spills.clear();
         for line in reader.lines() {
@@ -496,13 +502,13 @@ impl SortPreservingMergeStream {
         batch_size: usize,
     ) -> Result<Self> {
         let f = OpenOptions::new().read(true).open(MERGE_SORT_DATA).unwrap();
+        let last_batch_and_cursor_id: Vec<(usize, i64)> =
+            bincode::deserialize_from(&f).unwrap();
+        let mut batch_num_read = Vec::new();
+        for (batch_num, _) in &last_batch_and_cursor_id {
+            batch_num_read.push(*batch_num);
+        }
         let mut outputs: Vec<String> = bincode::deserialize_from(&f).unwrap();
-        let heap = bincode::deserialize_from(&f).unwrap();
-        let in_progress = bincode::deserialize_from(&f).unwrap();
-        let next_batch_id = bincode::deserialize_from(&f).unwrap();
-        let cursor_finished = bincode::deserialize_from(&f).unwrap();
-        let batch_id_keeper: Vec<(usize, usize)> = bincode::deserialize_from(&f).unwrap();
-
         let mut spills = Vec::new();
         let reader = BufReader::new(f);
         for line in reader.lines() {
@@ -517,19 +523,10 @@ impl SortPreservingMergeStream {
         println!("spills cnt: {}", spills.len());
         let stream_count = spills.len();
         let mut streams = Vec::new();
-        let mut batches: Vec<VecDeque<RecordBatch>> = (0..stream_count)
-            .into_iter()
-            .map(|_| VecDeque::new())
-            .collect();
+
         for i in 0..stream_count {
-            let stream = read_spill_as_stream(
-                &spills[i],
-                &schema,
-                &mut batches[i],
-                batch_id_keeper[i].0,
-                batch_id_keeper[i].1,
-            )
-            .unwrap();
+            let (b, _) = last_batch_and_cursor_id[i];
+            let stream = read_spill_as_stream(&spills[i], &schema, b).unwrap();
             streams.push(SortedStream::new(stream, 0).stream.fuse());
         }
 
@@ -557,23 +554,28 @@ impl SortPreservingMergeStream {
 
         Ok(Self {
             cnt: 0,
+            build_record_count: 0,
             writer,
             outputs,
             output_reader,
             reader_idx: 0,
             spills,
-            batch_id_keeper,
             context,
             schema,
-            batches,
-            cursor_finished,
+            batches: (0..stream_count)
+                .into_iter()
+                .map(|_| VecDeque::new())
+                .collect(),
+            cursor_finished: vec![false; stream_count],
             streams: MergingStreams::new(streams),
+            batch_num_read,
             column_expressions: expressions.iter().map(|x| x.expr.clone()).collect(),
             tracking_metrics,
             aborted: false,
-            in_progress,
-            next_batch_id,
-            heap,
+            in_progress: vec![],
+            last_batch_and_cursor_id,
+            next_batch_id: 0,
+            heap: BinaryHeap::with_capacity(stream_count),
             batch_size,
             row_converter,
         })
@@ -588,6 +590,7 @@ impl SortPreservingMergeStream {
         batch_size: usize,
     ) -> Result<Self> {
         let stream_count = streams.len();
+        println!("stream count {}", stream_count);
         let batches = (0..stream_count)
             .into_iter()
             .map(|_| VecDeque::new())
@@ -609,33 +612,101 @@ impl SortPreservingMergeStream {
         let mut outputs = Vec::new();
         outputs.push(persistent_file.path);
 
-        let mut batch_id_keeper: Vec<(usize, usize)> = Vec::new();
-        for _ in 0..stream_count {
-            batch_id_keeper.push((0, 0));
-        }
+        let last_batch_and_cursor_id = (0..stream_count)
+            .into_iter()
+            .map(|_| (0usize, -1))
+            .collect();
 
         Ok(Self {
             cnt: 0,
+            build_record_count: 0,
             writer,
             outputs,
             output_reader: Vec::new(),
             reader_idx: 0,
             spills,
-            batch_id_keeper,
             context,
             schema,
             batches,
             cursor_finished: vec![true; stream_count],
             streams: MergingStreams::new(wrappers),
+            batch_num_read: vec![0; stream_count],
             column_expressions: expressions.iter().map(|x| x.expr.clone()).collect(),
             tracking_metrics,
             aborted: false,
             in_progress: vec![],
+            last_batch_and_cursor_id,
             next_batch_id: 0,
             heap: BinaryHeap::with_capacity(stream_count),
             batch_size,
             row_converter,
         })
+    }
+
+    fn poll_stream_for_deserialize(
+        &mut self,
+        cx: &mut Context<'_>,
+        idx: usize,
+        cursor_id: usize,
+    ) -> Poll<ArrowResult<()>> {
+        let mut empty_batch = false;
+        {
+            let stream = &mut self.streams.streams[idx];
+            if stream.is_terminated() {
+                return Poll::Ready(Ok(()));
+            }
+            match futures::ready!(stream.poll_next_unpin(cx)) {
+                None => return Poll::Ready(Ok(())),
+                Some(Err(e)) => {
+                    return Poll::Ready(Err(e));
+                }
+                Some(Ok(batch)) => {
+                    if batch.num_rows() > 0 {
+                        let cols = self
+                            .column_expressions
+                            .iter()
+                            .map(|expr| {
+                                Ok(expr.evaluate(&batch)?.into_array(batch.num_rows()))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+
+                        let rows = match self.row_converter.convert_columns(&cols) {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                return Poll::Ready(Err(ArrowError::ExternalError(
+                                    Box::new(e),
+                                )));
+                            }
+                        };
+
+                        let mut cursor = SortKeyCursor::new_with_cursor(
+                            idx,
+                            // self.next_batch_id, // assign this batch an ID
+                            self.batch_num_read[idx],
+                            cursor_id,
+                            rows,
+                        );
+                        cursor.advance();
+                        if cursor.is_finished() {
+                            self.batch_num_read[idx] += 1;
+                            return self.poll_stream_for_deserialize(cx, idx, 0);
+                        } else {
+                            self.heap.push(Reverse(cursor));
+                            // self.next_batch_id += 1;
+                            self.batches[idx].push_back(batch);
+                        }
+                    } else {
+                        empty_batch = true;
+                    }
+                }
+            }
+        }
+        if empty_batch {
+            panic!("empty batch found");
+            self.poll_stream_for_deserialize(cx, idx, cursor_id)
+        } else {
+            Poll::Ready(Ok(()))
+        }
     }
 
     /// If the stream at the given index is not exhausted, and the last cursor for the
@@ -684,14 +755,15 @@ impl SortPreservingMergeStream {
 
                         let cursor = SortKeyCursor::new(
                             idx,
-                            self.next_batch_id, // assign this batch an ID
+                            // self.next_batch_id, // assign this batch an ID
+                            self.batch_num_read[idx],
                             rows,
                         );
-                        self.next_batch_id += 1;
+                        // self.next_batch_id += 1;
                         self.heap.push(Reverse(cursor));
                         self.cursor_finished[idx] = false;
                         self.batches[idx].push_back(batch);
-                        self.batch_id_keeper[idx].1 += 1;
+                        self.batch_num_read[idx] += 1;
                     } else {
                         empty_batch = true;
                     }
@@ -740,16 +812,17 @@ impl SortPreservingMergeStream {
                 );
 
                 if self.in_progress.is_empty() {
+                    panic!("no progress");
                     return make_arrow_array(array_data.freeze());
                 }
 
-                let first = &self.in_progress[0];
+                let first = &self.in_progress[0].0;
                 let mut buffer_idx =
                     stream_to_buffer_idx[first.stream_idx] + first.batch_idx;
                 let mut start_row_idx = first.row_idx;
                 let mut end_row_idx = start_row_idx + 1;
 
-                for row_index in self.in_progress.iter().skip(1) {
+                for (row_index, _) in self.in_progress.iter().skip(1) {
                     let next_buffer_idx =
                         stream_to_buffer_idx[row_index.stream_idx] + row_index.batch_idx;
 
@@ -774,7 +847,22 @@ impl SortPreservingMergeStream {
             })
             .collect();
 
-        self.in_progress.clear();
+        self.build_record_count += 1;
+
+        for (row_idx, batch_num_read) in self.in_progress.drain(..) {
+            let stream_num = row_idx.stream_idx;
+            let cursor_num = row_idx.row_idx;
+
+            if batch_num_read > self.last_batch_and_cursor_id[stream_num].0 {
+                self.last_batch_and_cursor_id[stream_num].0 = batch_num_read;
+                self.last_batch_and_cursor_id[stream_num].1 = cursor_num as i64;
+            } else if batch_num_read == self.last_batch_and_cursor_id[stream_num].0 {
+                if cursor_num as i64 > self.last_batch_and_cursor_id[stream_num].1 {
+                    self.last_batch_and_cursor_id[stream_num].1 = cursor_num as i64;
+                }
+            }
+        }
+        // self.in_progress.clear();
 
         // New cursors are only created once the previous cursor for the stream
         // is finished. This means all remaining rows from all but the last batch
@@ -784,11 +872,10 @@ impl SortPreservingMergeStream {
         // any RowIndex's reliant on the batch indexes
         //
         // We can therefore drop all but the last batch for each stream
-        for (stream_id, batches) in self.batches.iter_mut().enumerate() {
+        for batches in self.batches.iter_mut() {
             if batches.len() > 1 {
                 // Drain all but the last batch
                 batches.drain(0..(batches.len() - 1));
-                self.batch_id_keeper[stream_id].0 = self.batch_id_keeper[stream_id].1 - 1;
             }
         }
 
@@ -803,11 +890,37 @@ impl Stream for SortPreservingMergeStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        if !self.context.running() {
-            // if self.cnt == 3000 {
+        if self.aborted {
+            return Poll::Ready(None);
+        }
+
+        // if !self.context.running() {
+        if self.cnt == 3000 {
             self.serialize();
             return Poll::Ready(None);
         }
+
+        if self.cnt == 0 {
+            for i in 0..self.streams.num_streams() {
+                let (_, cursor_id) = self.last_batch_and_cursor_id[i];
+                if cursor_id < 0 {
+                    self.cursor_finished[i] = true;
+                    continue;
+                }
+                match futures::ready!(self.poll_stream_for_deserialize(
+                    cx,
+                    i,
+                    cursor_id as usize
+                )) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        self.aborted = true;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                }
+            }
+        }
+
         self.cnt += 1;
         // println!("poll count: {}", self.cnt);
         loop {
@@ -815,6 +928,7 @@ impl Stream for SortPreservingMergeStream {
                 let poll = self.poll_next_inner(cx);
                 return self.tracking_metrics.record_poll(poll);
             }
+            // read from already generated output
             let reader_idx = self.reader_idx;
             let reader = &mut self.output_reader[reader_idx];
             if let Some(batch) = reader.next() {
@@ -860,6 +974,7 @@ impl SortPreservingMergeStream {
                     let stream_idx = cursor.stream_idx();
                     let batch_idx = self.batches[stream_idx].len() - 1;
                     let row_idx = cursor.advance();
+                    let batch_num_read = cursor.batch_id();
 
                     let mut cursor_finished = false;
                     // insert the cursor back to heap if the record batch is not exhausted
@@ -870,11 +985,14 @@ impl SortPreservingMergeStream {
                         self.cursor_finished[stream_idx] = true;
                     }
 
-                    self.in_progress.push(RowIndex {
-                        stream_idx,
-                        batch_idx,
-                        row_idx,
-                    });
+                    self.in_progress.push((
+                        RowIndex {
+                            stream_idx,
+                            batch_idx,
+                            row_idx,
+                        },
+                        batch_num_read,
+                    ));
 
                     if self.in_progress.len() == self.batch_size {
                         let res = self.build_record_batch();
