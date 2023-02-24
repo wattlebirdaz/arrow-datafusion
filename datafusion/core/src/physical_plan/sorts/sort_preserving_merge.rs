@@ -25,6 +25,7 @@ use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::{Instant, SystemTime};
 
 use std::any::Any;
 use std::cmp::Reverse;
@@ -501,6 +502,7 @@ impl SortPreservingMergeStream {
         tracking_metrics: MemTrackingMetrics,
         batch_size: usize,
     ) -> Result<Self> {
+        let start = Instant::now();
         let f = OpenOptions::new().read(true).open(MERGE_SORT_DATA).unwrap();
         let last_batch_and_cursor_id: Vec<(usize, i64)> =
             bincode::deserialize_from(&f).unwrap();
@@ -551,6 +553,8 @@ impl SortPreservingMergeStream {
         let persistent_file = DiskManager::create_output_file().unwrap();
         let writer = FileWriter::try_new(persistent_file.file, &schema).unwrap();
         outputs.push(persistent_file.path);
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        println!("deserializing: {:.1} ms", elapsed);
 
         Ok(Self {
             cnt: 0,
@@ -894,8 +898,8 @@ impl Stream for SortPreservingMergeStream {
             return Poll::Ready(None);
         }
 
-        // if !self.context.running() {
-        if self.cnt == 3000 {
+        if !self.context.running() {
+            // if self.cnt == 3000 {
             self.serialize();
             return Poll::Ready(None);
         }
