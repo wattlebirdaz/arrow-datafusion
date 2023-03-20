@@ -18,6 +18,9 @@
 //! Manages files generated during query execution, files are
 //! hashed among the directories listed in RuntimeConfig::local_dirs.
 
+use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
+
 use crate::error::{DataFusionError, Result};
 use log::debug;
 use parking_lot::Mutex;
@@ -73,6 +76,20 @@ pub struct DiskManager {
     local_dirs: Mutex<Vec<TempDir>>,
 }
 
+/// Files that needs to be persistent in disk
+#[derive(Serialize, Deserialize)]
+pub struct NamedPersistentFile {
+    /// Relative path from the root of this project
+    pub path: String,
+}
+
+impl NamedPersistentFile {
+    /// Get relative path
+    pub fn path(&self) -> &String {
+        &self.path
+    }
+}
+
 impl DiskManager {
     /// Create a DiskManager given the configuration
     pub fn try_new(config: DiskManagerConfig) -> Result<Arc<Self>> {
@@ -111,6 +128,21 @@ impl DiskManager {
         }
 
         create_tmp_file(&local_dirs)
+    }
+
+    /// Return a persistent file from a randomized choice in the current directory
+    pub fn create_persistent_file(&self) -> Result<NamedPersistentFile> {
+        let local_dirs = String::from("./temp/");
+        let mut rng = rand::thread_rng();
+        let x: u64 = rng.gen();
+        let path = local_dirs + &x.to_string();
+        let _file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        Ok(NamedPersistentFile { path })
     }
 }
 

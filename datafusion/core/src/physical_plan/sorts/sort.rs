@@ -55,12 +55,79 @@ use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tempfile::NamedTempFile;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task;
+
+use crate::execution::disk_manager::NamedPersistentFile;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use std::fs::{self, OpenOptions};
+use std::io::prelude::*;
+
+/// State (de)serializer
+pub struct State<T: Serialize + DeserializeOwned> {
+    /// If true, it does not serialize
+    pub completed: bool,
+    /// Unique id
+    pub id: usize,
+    /// Variables to serialize
+    pub data: T,
+}
+
+impl<T: Serialize + DeserializeOwned> State<T> {
+    /// Create new state
+    pub fn new(id: usize, data: T) -> Self {
+        Self {
+            completed: false,
+            id,
+            data,
+        }
+    }
+
+    /// Get filename to serialize
+    pub fn file_name(&self) -> String {
+        format!("state-{}", self.id)
+    }
+
+    /// Serializes the data
+    pub fn serialize_data(&self) {
+        if !self.completed {
+            let data = bincode::serialize(&self.data).unwrap();
+            println!("Serializing ... size: {} bytes", data.len());
+            let mut file = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .create(true)
+                .open(self.file_name())
+                .unwrap();
+            file.write_all(&data).unwrap();
+            println!("Serializing done");
+        }
+    }
+
+    /// Deserializes the data
+    pub fn deserialize_data(&mut self) {
+        if std::path::Path::new(&self.file_name()).exists() {
+            println!("Deserializing...");
+            let file = OpenOptions::new()
+                .read(true)
+                .open(self.file_name())
+                .unwrap();
+            self.data = bincode::deserialize_from(file).unwrap();
+            fs::remove_file(self.file_name()).unwrap();
+            println!("Deserializing done");
+        }
+    }
+}
+
+impl<T: Serialize + DeserializeOwned> Drop for State<T> {
+    fn drop(&mut self) {
+        self.serialize_data();
+    }
+}
 
 /// Sort arbitrary size of data to get a total order (may spill several times during sorting based on free memory available).
 ///
@@ -71,11 +138,17 @@ use tokio::task;
 /// 2.2 if the memory threshold is reached, sort all buffered batches and spill to file.
 ///     buffer the batch in memory, go to 1.
 /// 3. when input is exhausted, merge all in memory batches and spills to get a total order.
+#[derive(Serialize, Deserialize)]
+struct LocalVariables {
+    resuming_position: usize,
+    cursor: isize, // the largest batch number that has already been spilled to disk
+    spills: Vec<NamedPersistentFile>,
+}
+
 struct ExternalSorter {
     id: MemoryConsumerId,
     schema: SchemaRef,
-    in_mem_batches: Mutex<Vec<BatchWithSortArray>>,
-    spills: Mutex<Vec<NamedTempFile>>,
+    in_mem_batches: Mutex<Vec<(usize, BatchWithSortArray)>>,
     /// Sort expressions
     expr: Vec<PhysicalSortExpr>,
     session_config: Arc<SessionConfig>,
@@ -83,6 +156,7 @@ struct ExternalSorter {
     metrics_set: CompositeMetricsSet,
     metrics: BaselineMetrics,
     fetch: Option<usize>,
+    state: Mutex<State<LocalVariables>>,
 }
 
 impl ExternalSorter {
@@ -96,25 +170,42 @@ impl ExternalSorter {
         fetch: Option<usize>,
     ) -> Self {
         let metrics = metrics_set.new_intermediate_baseline(partition_id);
+
+        let mut state = State::new(
+            12978194,
+            LocalVariables {
+                resuming_position: 0,
+                cursor: -1,
+                spills: vec![],
+            },
+        );
+        state.deserialize_data();
+
         Self {
             id: MemoryConsumerId::new(partition_id),
             schema,
             in_mem_batches: Mutex::new(vec![]),
-            spills: Mutex::new(vec![]),
             expr,
             session_config,
             runtime,
             metrics_set,
             metrics,
             fetch,
+            state: Mutex::new(state),
         }
     }
 
     async fn insert_batch(
         &self,
+        cursor: usize,
         input: RecordBatch,
         tracking_metrics: &MemTrackingMetrics,
     ) -> Result<()> {
+        let state = self.state.lock().await;
+        if cursor as isize <= state.data.cursor {
+            return Ok(());
+        }
+        drop(state);
         if input.num_rows() > 0 {
             let size = batch_byte_size(&input);
             self.try_grow(size).await?;
@@ -146,57 +237,48 @@ impl ExternalSorter {
                 }
                 Ordering::Equal => {}
             }
-            in_mem_batches.push(partial);
+            in_mem_batches.push((cursor, partial));
         }
         Ok(())
     }
 
     async fn spilled_before(&self) -> bool {
-        let spills = self.spills.lock().await;
-        !spills.is_empty()
+        let state = self.state.lock().await;
+        !state.data.spills.is_empty()
     }
 
     /// MergeSort in mem batches as well as spills into total order with `SortPreservingMergeStream`.
     async fn sort(&self) -> Result<SendableRecordBatchStream> {
         let partition = self.partition_id();
         let batch_size = self.session_config.batch_size();
-        let mut in_mem_batches = self.in_mem_batches.lock().await;
 
         if self.spilled_before().await {
+            self.spill().await?;
+
             let tracking_metrics = self
                 .metrics_set
                 .new_intermediate_tracking(partition, self.runtime.clone());
             let mut streams: Vec<SortedStream> = vec![];
-            if in_mem_batches.len() > 0 {
-                let in_mem_stream = in_mem_partial_sort(
-                    &mut in_mem_batches,
-                    self.schema.clone(),
-                    &self.expr,
-                    batch_size,
-                    tracking_metrics,
-                    self.fetch,
-                )?;
-                let prev_used = self.free_all_memory();
-                streams.push(SortedStream::new(in_mem_stream, prev_used));
-            }
 
-            let mut spills = self.spills.lock().await;
+            let state = self.state.lock().await;
 
-            for spill in spills.drain(..) {
-                let stream = read_spill_as_stream(spill, self.schema.clone())?;
+            for spill in &state.data.spills {
+                let stream = read_spill_as_stream(&spill, self.schema.clone())?;
                 streams.push(SortedStream::new(stream, 0));
             }
             let tracking_metrics = self
                 .metrics_set
                 .new_final_tracking(partition, self.runtime.clone());
-            Ok(Box::pin(SortPreservingMergeStream::new_from_streams(
+            return Ok(Box::pin(SortPreservingMergeStream::new_from_streams(
                 streams,
                 self.schema.clone(),
                 &self.expr,
                 tracking_metrics,
                 self.session_config.batch_size(),
-            )?))
-        } else if in_mem_batches.len() > 0 {
+            )?));
+        }
+        let mut in_mem_batches = self.in_mem_batches.lock().await;
+        if in_mem_batches.len() > 0 {
             let tracking_metrics = self
                 .metrics_set
                 .new_final_tracking(partition, self.runtime.clone());
@@ -290,7 +372,8 @@ impl MemoryConsumer for ExternalSorter {
             .metrics_set
             .new_intermediate_tracking(partition, self.runtime.clone());
 
-        let spillfile = self.runtime.disk_manager.create_tmp_file()?;
+        let spillfile = self.runtime.disk_manager.create_persistent_file()?;
+        let last_batch_id = in_mem_batches.last().unwrap().0;
         let stream = in_mem_partial_sort(
             &mut in_mem_batches,
             self.schema.clone(),
@@ -302,10 +385,13 @@ impl MemoryConsumer for ExternalSorter {
 
         spill_partial_sorted_stream(&mut stream?, spillfile.path(), self.schema.clone())
             .await?;
-        let mut spills = self.spills.lock().await;
+
+        let mut state = self.state.lock().await;
+        state.data.spills.push(spillfile);
+        state.data.cursor = last_batch_id as isize;
+
         let used = self.metrics.mem_used().set(0);
         self.metrics.record_spill(used);
-        spills.push(spillfile);
         Ok(used)
     }
 
@@ -316,7 +402,7 @@ impl MemoryConsumer for ExternalSorter {
 
 /// consume the non-empty `sorted_batches` and do in_mem_sort
 fn in_mem_partial_sort(
-    buffered_batches: &mut Vec<BatchWithSortArray>,
+    buffered_batches: &mut Vec<(usize, BatchWithSortArray)>,
     schema: SchemaRef,
     expressions: &[PhysicalSortExpr],
     batch_size: usize,
@@ -328,7 +414,7 @@ fn in_mem_partial_sort(
         let result = buffered_batches.pop();
         Ok(Box::pin(SizedRecordBatchStream::new(
             schema,
-            vec![Arc::new(result.unwrap().sorted_batch)],
+            vec![Arc::new(result.unwrap().1.sorted_batch)],
             tracking_metrics,
         )))
     } else {
@@ -336,7 +422,7 @@ fn in_mem_partial_sort(
             buffered_batches
                 .drain(..)
                 .into_iter()
-                .map(|b| {
+                .map(|(_, b)| {
                     let BatchWithSortArray {
                         sort_arrays,
                         sorted_batch: batch,
@@ -593,7 +679,7 @@ impl RecordBatchStream for SortedSizedRecordBatchStream {
 
 async fn spill_partial_sorted_stream(
     in_mem_stream: &mut SendableRecordBatchStream,
-    path: &Path,
+    path: &String,
     schema: SchemaRef,
 ) -> Result<()> {
     let (sender, receiver) = tokio::sync::mpsc::channel(2);
@@ -613,16 +699,20 @@ async fn spill_partial_sorted_stream(
 }
 
 fn read_spill_as_stream(
-    path: NamedTempFile,
+    path: &NamedPersistentFile,
     schema: SchemaRef,
 ) -> Result<SendableRecordBatchStream> {
     let (sender, receiver): (
         Sender<ArrowResult<RecordBatch>>,
         Receiver<ArrowResult<RecordBatch>>,
     ) = tokio::sync::mpsc::channel(2);
+    let path_str = path.path().clone();
     let join_handle = task::spawn_blocking(move || {
-        if let Err(e) = read_spill(sender, path.path()) {
-            error!("Failure while reading spill file: {:?}. Error: {}", path, e);
+        if let Err(e) = read_spill(sender, &path_str) {
+            error!(
+                "Failure while reading spill file: {:?}. Error: {}",
+                &path_str, e
+            );
         }
     });
     Ok(RecordBatchReceiverStream::create(
@@ -651,7 +741,7 @@ fn write_sorted(
     Ok(())
 }
 
-fn read_spill(sender: Sender<ArrowResult<RecordBatch>>, path: &Path) -> Result<()> {
+fn read_spill(sender: Sender<ArrowResult<RecordBatch>>, path: &String) -> Result<()> {
     let file = BufReader::new(File::open(path)?);
     let reader = FileReader::try_new(file, None)?;
     for batch in reader {
@@ -919,18 +1009,36 @@ async fn do_sort(
         fetch,
     );
     context.runtime_env().register_requester(sorter.id());
-    while let Some(batch) = input.next().await {
-        let batch = batch?;
-        sorter.insert_batch(batch, &tracking_metrics).await?;
+
+    loop {
+        let resuming_position = sorter.state.lock().await.data.resuming_position;
+        match resuming_position {
+            0 => {
+                let mut cursor = 0;
+                while let Some(batch) = input.next().await {
+                    let batch = batch?;
+                    sorter
+                        .insert_batch(cursor, batch, &tracking_metrics)
+                        .await?;
+                    cursor += 1;
+                }
+                sorter.state.lock().await.data.resuming_position = 1;
+            }
+            1 => {
+                let result = sorter.sort().await;
+                debug!(
+                    "End do_sort for partition {} of context session_id {} and task_id {:?}",
+                    partition_id,
+                    context.session_id(),
+                    context.task_id()
+                );
+                return result;
+            }
+            _ => {
+                panic!("undefined state");
+            }
+        }
     }
-    let result = sorter.sort().await;
-    debug!(
-        "End do_sort for partition {} of context session_id {} and task_id {:?}",
-        partition_id,
-        context.session_id(),
-        context.task_id()
-    );
-    result
 }
 
 #[cfg(test)]
