@@ -97,7 +97,7 @@ impl MemoryManagerConfig {
     }
 
     /// return the maximum size of the memory, in bytes, this config will allow
-    fn pool_size(&self) -> usize {
+    pub fn pool_size(&self) -> usize {
         match self {
             MemoryManagerConfig::Existing(existing) => existing.pool_size,
             MemoryManagerConfig::New {

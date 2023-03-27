@@ -432,6 +432,8 @@ async fn collect_left_input(
         start.elapsed().as_millis()
     );
 
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    println!("hashmap creation: {}", elapsed);
     Ok((hashmap, single_batch))
 }
 

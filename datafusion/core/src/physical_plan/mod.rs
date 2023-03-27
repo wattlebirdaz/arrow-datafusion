@@ -16,6 +16,7 @@
 // under the License.
 
 //! Traits for physical query plan, supporting parallel execution for partitioned relations.
+use std::time::Instant;
 
 pub use self::metrics::Metric;
 use self::metrics::MetricsSet;
