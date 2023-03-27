@@ -61,6 +61,8 @@ use std::task::{Context, Poll};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task;
 
+use std::time::Instant;
+
 use crate::execution::disk_manager::NamedPersistentFile;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -990,6 +992,7 @@ async fn do_sort(
     context: Arc<TaskContext>,
     fetch: Option<usize>,
 ) -> Result<SendableRecordBatchStream> {
+    let start = Instant::now();
     debug!(
         "Start do_sort for partition {} of context session_id {} and task_id {:?}",
         partition_id,
@@ -1032,6 +1035,8 @@ async fn do_sort(
                     context.session_id(),
                     context.task_id()
                 );
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                println!("do_sort: {}ms", elapsed);
                 return result;
             }
             _ => {
